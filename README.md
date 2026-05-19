@@ -1,546 +1,372 @@
 # 🤖 顏色分揀機械手臂 - Color Sorting Robot Arm
 
-使用 OpenCV + ArUco 四點定位 + ESP32 UDP 控制的顏色分揀機械手臂 Demo 專題。
+使用 OpenCV 顏色偵測 + ESP32 UDP 控制的顏色分揀機械手臂 Demo 專題。
 
 ---
 
-## 這個專題在做什麼
+## 系統概覽
 
-這套系統的目標，是讓機械手臂可以自動完成「看見物體、判斷顏色、夾起物體、放到對應位置」這整條流程。
+攝影機拍到工作區畫面後，Python 端偵測紅、綠、藍色物品，並在物品進入畫面中央準心區域且穩定一定幀數後，透過 UDP 傳送 `PICK:RED / PICK:GREEN / PICK:BLUE` 指令給 ESP32，ESP32 再驅動四顆伺服馬達自動完成夾取與放置。
 
-系統會依序完成以下工作：
-
-1. 用攝影機看到工作區。
-2. 偵測紅色、綠色、藍色物品。
-3. 使用 ArUco 四點標記建立工作平面的座標系。
-4. 算出物體在工作區中的位置。
-5. 控制機械手臂移動到物體上方並夾取。
-6. 根據顏色，把物體放到指定的放置點。
-
-這份專題程式被拆成 4 個檔案，每個檔案只做一件主要工作。這樣做的好處是：
-
-- 比較容易看懂。
-- 比較容易分工。
-- 出錯時比較容易找到問題在哪一層。
-- 後續要改功能時，不需要全部重寫。
-
----
-
-## 專案檔案結構
-
-```text
-project/
-├── vision.py        # 眼睛：攝影機、ArUco 定位、顏色偵測
-├── planner.py       # 大腦：自動夾取流程的狀態機
-├── kinematics.py    # 翻譯：把座標轉成手臂角度
-├── main.py          # 總控：把以上三個整合，送命令給 ESP32
-└── README.md        # 本說明文件
 ```
-
----
-
-## 四個程式分別在做什麼
-
-### 1) vision.py
-
-`vision.py` 可以把它想成整個系統的「眼睛」。
-
-它主要負責：
-
-- 開啟攝影機。
-- 偵測 4 個 ArUco 標記。
-- 建立工作區的平面座標轉換。
-- 偵測紅色、綠色、藍色物體。
-- 輸出物體的像素位置與世界座標。
-
-### vision.py 的輸入
-
-- 攝影機畫面。
-- 工作區四角的 ArUco marker。
-- 紅、綠、藍物品。
-
-### vision.py 的輸出
-
-當程式找到目標後，會整理成一份觀測資料，例如：
-
-- 物體顏色：RED / GREEN / BLUE
-- 畫面座標：`pixel_x`, `pixel_y`
-- 工作區座標：`world_x`, `world_y`
-- 工作區是否已成功標定：`workspace_ready`
-
-### 為什麼要把 vision.py 獨立出來
-
-因為「看見什麼」和「要怎麼動」是兩件不同的事。
-
-如果視覺和控制寫在同一支程式裡，一旦畫面出問題，你會很難判斷到底是：
-
-- 相機沒抓到。
-- 顏色沒辨識到。
-- ArUco 沒定位成功。
-- 還是馬達控制有問題。
-
-把 vision.py 獨立出來之後，你們就可以先單獨確認：
-
-- 有沒有看到 ArUco。
-- 有沒有看到顏色。
-- 座標有沒有算對。
-
-這樣 debug 會輕鬆很多。
-
----
-
-### 2) planner.py
-
-`planner.py` 可以把它想成整個系統的「大腦」。
-
-它不直接處理影像，也不直接控制馬達，而是專門決定：
-
-- 現在是不是該開始抓。
-- 下一步應該做什麼。
-- 什麼時候要從抓取切換到放置。
-- 什麼時候要回到原點。
-
-### planner.py 的核心工作
-
-它會用「狀態機」去管理整個流程。
-
-你可以把狀態機理解成「做事的步驟表」，例如：
-
-1. `SEARCH`：找目標。
-2. `PICK_ABOVE`：移動到物體上方。
-3. `PICK_DOWN`：下降到抓取位置。
-4. `GRAB`：夾爪閉合。
-5. `LIFT`：把物體抬起來。
-6. `PLACE_ABOVE`：移到對應顏色放置點上方。
-7. `PLACE_DOWN`：下降到放置位置。
-8. `RELEASE`：張開夾爪。
-9. `RETURN_HOME`：回到待命位置。
-
-### 為什麼需要 planner.py
-
-因為機械手臂不能只靠「看到東西就立刻動」。
-
-如果沒有流程控制，它可能會出現這些問題：
-
-- 物體晃一下，手臂就一直改方向。
-- 還沒夾穩就開始移動。
-- 放置還沒完成就重新開始搜尋。
-- 整個流程混在一起，最後手臂動作很亂。
-
-所以 planner.py 的工作，就是讓手臂照步驟做事，而不是每一幀畫面都重新做決定。
-
----
-
-### 3) kinematics.py
-
-`kinematics.py` 可以把它想成整個系統的「翻譯器」。
-
-它負責把「工作區中的位置」翻譯成「手臂每個關節要轉多少度」。
-
-### kinematics.py 的核心工作
-
-它會處理這些事情：
-
-- 定義手臂姿態 `ArmPose`。
-- 定義 Home 位置。
-- 根據物體位置生成抓取姿態。
-- 根據顏色生成放置姿態。
-- 限制角度範圍，避免馬達超出安全範圍。
-
-### 為什麼需要 kinematics.py
-
-因為相機只知道：
-
-- 物體在工作區的哪裡。
-
-但 ESP32 和伺服馬達要知道的是：
-
-- 底座要轉幾度。
-- 肩部要轉幾度。
-- 手肘要轉幾度。
-- 夾爪要打開還是關閉。
-
-這就是 kinematics.py 的用途：把座標翻譯成可以直接執行的角度命令。
-
-### 為什麼現在先用 demo 版映射
-
-目前這個版本先採用「可快速調整的 demo 映射法」，而不是一開始就上完整逆運動學。
-
-這樣做的原因很實際：
-
-- 先讓整套系統跑得起來。
-- 組員比較容易看懂。
-- 角度不對時，比較容易手動微調。
-- 等 demo 穩定後，再升級成真正的逆運動學也比較安全。
-
----
-
-### 4) main.py
-
-`main.py` 是整個專案的「總控台」。
-
-它本身不負責做複雜演算法，而是把其他三個模組串在一起。
-
-### main.py 的工作
-
-主迴圈裡面會依序做這些事情：
-
-1. 從攝影機讀取影像。
-2. 把影像交給 `vision.py`。
-3. 把 vision 的結果交給 `planner.py`。
-4. 把 planner 決定好的姿態交給 `kinematics.py`。
-5. 把最後得到的四軸角度，用 UDP 傳給 ESP32。
-6. 同時在畫面上顯示目前狀態。
-
-### 為什麼要有 main.py
-
-因為總要有一支程式負責把所有模組接起來。
-
-如果每個模組都互相直接亂呼叫，整個專案會非常難維護。把整合工作集中在 main.py，有幾個好處：
-
-- 邏輯清楚。
-- 測試方便。
-- 改單一模組時，不會影響整個系統結構。
-
----
-
-## 四個程式之間怎麼合作
-
-你可以把整個資料流理解成下面這條鏈：
-
-```text
 攝影機畫面
    ↓
-vision.py      -> 辨識顏色、定位工作區、算出目標座標
-   ↓
-planner.py     -> 決定現在是搜尋、抓取、抬起還是放置
-   ↓
-kinematics.py  -> 把目標位置換成手臂角度
-   ↓
-main.py        -> 用 UDP 傳給 ESP32
-   ↓
-ESP32          -> 驅動四顆伺服馬達
+test_version_2-2.py   → 顏色辨識、狀態機、UDP 自動發現 + 傳送指令
+   ↓ UDP Port 8888
+sketch_may19a.ino     → 接收指令、驅動四顆伺服馬達、回傳 ACK
 ```
 
-簡單講：
+---
 
-- `vision.py` 負責「看」。
-- `planner.py` 負責「想」。
-- `kinematics.py` 負責「翻譯」。
-- `main.py` 負責「串起來並送出去」。
+## 硬體需求
+
+| 零件 | 說明 |
+|---|---|
+| ESP32 開發板 | 接收 UDP 指令，驅動伺服馬達 |
+| 伺服馬達 × 4 | M1 底座旋轉、M2 肩關節、M3 肘關節、M4 夾爪 |
+| 攝影機 | 筆電內建或 USB webcam |
+| 熱點 | 電腦 Wi-Fi 共享 或 **手機 2.4GHz 熱點** |
+
+> ⚠️ **ESP32 只支援 2.4GHz Wi-Fi**，手機熱點請確保開啟 2.4GHz 頻段。
 
 ---
 
-## 為什麼要這樣拆模組
+## Python 端：`test_version_2-2.py`
 
-這種拆法最重要的優點，就是「好維護、好 debug、好分工」。
+### 整體架構
 
-### 好維護
+這支程式把所有功能整合在單一檔案，分成幾個獨立區塊：
 
-如果之後你想改顏色辨識方法，例如：
-
-- 從 HSV 改成深度學習。
-- 從 webcam 改成 ESP32-CAM。
-
-你通常只需要改 `vision.py`，其他層可以盡量不動。
-
-### 好 debug
-
-如果今天系統出問題，你可以比較快知道是哪一層有問題：
-
-- 看不到物體：先查 `vision.py`
-- 流程亂跳：先查 `planner.py`
-- 手臂角度不對：先查 `kinematics.py`
-- 網路沒送出去：先查 `main.py` 或 ESP32
-
-### 好分工
-
-專題組員可以分工合作，例如：
-
-- A 負責視覺。
-- B 負責手臂角度調整。
-- C 負責 ESP32 韌體。
-- D 負責整合與測試。
-
-這樣不會全部擠在一支程式裡互相卡住。
-
----
-
-## 執行前需要準備什麼
-
-在正式執行前，你需要先確認下面幾件事情。
-
-### 1. 安裝 Python 套件
-
-請先安裝：
-
-```bash
-pip install opencv-contrib-python numpy
+```
+UDP 網路設定
+攝影機設定
+系統控制參數
+HSV 顏色範圍設定
+狀態機全域變數
+建立 UDP Socket
+主迴圈（影像處理 + 狀態機 + 鍵盤控制）
 ```
 
-注意：這裡建議使用 `opencv-contrib-python`，因為 ArUco 模組通常在這個版本裡面。
-
-### 2. 準備 4 個 ArUco 標記
-
-請把 4 個 marker 印出來，並依照固定位置貼在工作區四角：
-
-- ID 0：左下
-- ID 1：右下
-- ID 2：右上
-- ID 3：左上
-
-### 3. 確認 ESP32 已燒錄對應韌體
-
-ESP32 端必須能接收：
-
-- `START`
-- `STOP`
-- `HOME`
-- `base,shoulder,elbow,claw` 這種四軸角度字串
-
-### 4. 確認相機來源正常
-
-如果你們使用的是：
-
-- 筆電內建相機，通常 `camera_index=0`
-- Iriun Webcam，可能要改成 `1` 或 `2`
-
 ---
 
-## 第一次使用時要改哪些地方
+### 網路模組：UDP 自動發現 + ACK 確認
 
-打開 `main.py`，你至少要先改這幾個設定。
+這版的最大特點是 **不需要手動填寫 ESP32 的 IP**。
 
-### 1. ESP32 IP
+啟動時會向廣播位址 `255.255.255.255:8888` 送出 `DISCOVER_ESP32` 封包，同一網段內的 ESP32 收到後會回傳 `ESP32_HERE|IP=...|PORT=...|RSSI=...`，Python 端從回覆封包的來源位址自動記錄 ESP32 的 IP。
 
 ```python
-ESP_IP = "192.168.137.232"
-ESP_PORT = 8888
+ESP_PORT        = 8888          # ESP32 監聽的 UDP Port
+LOCAL_PORT      = 8890          # Python 接收 ACK 用的 Port
+BROADCAST_IP    = "255.255.255.255"
+DISCOVERY_MESSAGE      = "DISCOVER_ESP32"
+DISCOVERY_REPLY_PREFIX = "ESP32_HERE"
+MANUAL_ESP_IP   = None          # 若不想用自動發現，可改成字串固定 IP
+COMMAND_RETRIES = 2             # 送指令失敗後的重試次數
+COMMAND_TIMEOUT = 1.0           # 等待 ACK 的逾時秒數
 ```
 
-請把 `ESP_IP` 改成你自己的 ESP32 IP。
+**三個核心網路函式：**
 
-### 2. 工作區大小
+| 函式 | 說明 |
+|---|---|
+| `discover_esp32(force)` | 送廣播封包，自動取得 ESP32 IP，最多重試 3 次 |
+| `ensure_esp32_ready()` | 若尚未發現 ESP32 則呼叫 `discover_esp32`，確保 IP 已知 |
+| `send_cmd(cmd, expect_reply)` | 送指令給 ESP32，等待 ACK，失敗則重試，最多 `COMMAND_RETRIES` 次 |
+
+**ACK 回傳格式範例：**
+
+| 送出指令 | 收到 ACK |
+|---|---|
+| `PING` | `PONG\|IP=192.168.x.x\|RSSI=-55` |
+| `STATUS` | `STATUS\|IP=...\|GW=...\|RSSI=...\|BUSY=0\|M1=90\|M2=90\|M3=90\|M4=110` |
+| `HOME` | `OK\|HOME` |
+| `PICK:RED` | `ACK\|PICK_START\|RED` → 動作完成後 `DONE\|PICK\|RED` |
+| `M2:45` | `OK\|M2=45` |
+
+---
+
+### 顏色偵測模組
+
+每一幀先做高斯模糊，再轉 HSV，對三個顏色各自建立遮罩，找最大輪廓並取最小外接圓。
 
 ```python
-vision_cfg = VisionConfig(
-    camera_index=0,
-    work_width_mm=300.0,
-    work_height_mm=200.0,
-)
+# 紅色需要兩段遮罩合併（HSV 環形邊界）
+mask_r = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+mask_g = cv2.inRange(hsv, lower_green, upper_green)
+mask_b = cv2.inRange(hsv, lower_blue, upper_blue)
 ```
 
-這裡的 `work_width_mm` 和 `work_height_mm` 要改成你們實際工作平台的尺寸。
+**可調整的 HSV 範圍：**
 
-### 3. 三個顏色的放置點
+| 顏色 | H 範圍 | S 範圍 | V 範圍 |
+|---|---|---|---|
+| 紅（低段） | 0 ~ 10 | 120 ~ 255 | 70 ~ 255 |
+| 紅（高段） | 170 ~ 180 | 120 ~ 255 | 70 ~ 255 |
+| 綠 | 40 ~ 80 | 50 ~ 255 | 50 ~ 255 |
+| 藍 | 100 ~ 130 | 50 ~ 255 | 50 ~ 255 |
 
-```python
-kin_cfg = KinematicsConfig(
-    work_width_mm=300.0,
-    work_height_mm=200.0,
-    place_points={
-        "RED": (260.0, 160.0),
-        "GREEN": (260.0, 100.0),
-        "BLUE": (260.0, 40.0),
-    }
-)
-```
-
-這三個座標要改成你們真正想放置紅、綠、藍物品的位置。
+遮罩先做 erode（2次）再 dilate（2次）去除雜訊，輪廓面積小於 `MIN_AREA=250` 或半徑小於 `MIN_RADIUS=12` 的偵測結果直接丟棄。
 
 ---
 
-## 怎麼執行
+### 狀態機模組
 
-### 步驟 1：把 4 個檔案放在同一個資料夾
+狀態機決定「目前應該做什麼」，共有三個狀態：
 
-請確認以下檔案都在同一層：
+```
+SEARCH
+  ├─ 無目標  → 穩定計數歸零
+  ├─ 目標在準心框外 → 顯示 "Place object on cross"
+  └─ 目標在準心框內且穩定 LOCK_FRAMES=12 幀
+       └─ AUTO_RUN=True → 送 PICK:COLOR → 進入 WAIT_PICK
 
-- `vision.py`
-- `planner.py`
-- `kinematics.py`
-- `main.py`
-- `README.md`
+WAIT_PICK
+  └─ 倒數 PICK_WAIT_SECONDS=4.5 秒（等 ESP32 完成動作）
+       └─ 進入 WAIT_CLEAR
 
-### 步驟 2：打開終端機
+WAIT_CLEAR
+  └─ 等物品離開準心框 CLEAR_FRAMES_REQUIRED=8 幀
+       └─ 回到 SEARCH
+```
 
-切換到這個專案資料夾。
+**可調整參數：**
+
+| 參數 | 預設值 | 說明 |
+|---|---|---|
+| `LOCK_FRAMES` | 12 | 觸發夾取所需的連續穩定幀數 |
+| `PICK_WAIT_SECONDS` | 4.5 | 等 ESP32 完成動作的時間（秒） |
+| `CLEAR_FRAMES_REQUIRED` | 8 | 確認物品已被移走所需的幀數 |
+| `TARGET_ZONE_HALF_W` | 35 | 準心夾取框半寬（像素） |
+| `TARGET_ZONE_HALF_H` | 35 | 準心夾取框半高（像素） |
+| `TARGET_STABLE_DIST` | 18 | 前後幀判定為「同一目標」的最大位移（像素） |
+
+---
+
+### HUD 顯示
+
+畫面左上角會即時顯示以下資訊：
+
+```
+ESP32 IP  : 192.168.x.x
+NET       : ACK_OK
+State     : LOCKING 8/12
+Color     : RED
+Zone      : IN
+Stable    : 8/12
+Clear     : 0/8
+AUTO_RUN  : True
+LAST CMD  : PICK:RED
+LAST ACK  : ACK|PICK_START|RED
+```
+
+---
+
+### 鍵盤控制
+
+| 按鍵 | 功能 |
+|---|---|
+| `q` | 離開程式 |
+| `s` | 切換 AUTO_RUN 開/關 |
+| `d` | 重新搜尋 ESP32 |
+| `p` | PING（測試 ESP32 是否在線） |
+| `u` | STATUS（查詢 ESP32 狀態） |
+| `h` | HOME（手臂回原點） |
+| `o` | OPEN（夾爪打開） |
+| `c` | CLOSE（夾爪關閉） |
+| `r` / `g` / `b` | 手動觸發紅 / 綠 / 藍夾取 |
+| `1` / `2` / `3` / `4` | 手動測試單顆伺服馬達回 90° / 90° / 90° / 110° |
+| `z` / `x` | M1 底座微調（BASE:80 / BASE:100） |
+
+---
+
+## ESP32 端：`sketch_may19a.ino`
+
+### 整體架構
+
+```
+Wi-Fi 設定（SSID / Password）
+UDP 設定（Port 8888）
+Servo 角度常數定義
+工具函式（isNumericString / replyUdp / getStatusString）
+Wi-Fi 連線與斷線重連（connectWiFiDHCP / ensureWiFi）
+Servo 動作函式（slowMove / openGripper / closeGripper / goHome / pickAndPlace）
+指令處理（handleCommand）
+setup / loop
+```
+
+---
+
+### Wi-Fi 設定
+
+ESP32 使用 **DHCP 自動取得 IP**，不需要在程式裡寫死固定 IP。
+
+```cpp
+const char* ssid     = "你的熱點名稱";
+const char* password = "你的熱點密碼";
+```
+
+`connectWiFiDHCP()` 連線時會在 Serial Monitor 印出實際取得的 IP、Gateway、Subnet、RSSI，連線逾時（60次重試）後自動重啟連線流程。
+
+`ensureWiFi()` 每 3000 ms 檢查一次 Wi-Fi 狀態，若斷線則自動重連並重新 `Udp.begin(8888)`，整個主迴圈不需要處理斷線問題。
+
+---
+
+### UDP 設定
+
+```cpp
+const uint16_t localPort = 8888;        // 監聽 Port
+const char* DISCOVERY_MESSAGE = "DISCOVER_ESP32";  // 自動發現觸發字
+```
+
+ESP32 在 `loop()` 裡每次呼叫 `Udp.parsePacket()`，收到封包後交給 `handleCommand()` 處理，並用 `replyUdp()` 把回應送回 Python 端的來源 IP + Port。
+
+---
+
+### Servo 角度常數
+
+所有關節位置都用具名常數定義，方便調整：
+
+```cpp
+// Home 位置
+const int HOME_M1 = 90;   // 底座
+const int HOME_M2 = 90;   // 肩關節
+const int HOME_M3 = 90;   // 肘關節
+const int HOME_M4 = 110;  // 夾爪（半開）
+
+// 夾爪開合
+const int GRIP_OPEN  = 115;
+const int GRIP_CLOSE = 70;
+
+// 下降夾取
+const int PICK_DOWN_M2 = 34;
+const int PICK_DOWN_M3 = 90;
+
+// 抬起
+const int PICK_UP_M2 = 85;
+const int PICK_UP_M3 = 95;
+
+// 放置高度
+const int PLACE_DOWN_M2 = 36;
+const int PLACE_DOWN_M3 = 70;
+
+// 各顏色放置點的底座角度
+const int PLACE_RED_M1   = 40;
+const int PLACE_GREEN_M1 = 115;
+const int PLACE_BLUE_M1  = 140;
+```
+
+**接線對應：**
+
+| 馬達 | GPIO | 功能 |
+|---|---|---|
+| M1 | GPIO 18 | 底座旋轉 |
+| M2 | GPIO 19 | 肩關節 |
+| M3 | GPIO 21 | 肘關節 |
+| M4 | GPIO 22 | 夾爪 |
+
+---
+
+### Servo 動作函式
+
+**`slowMove(motorID, target)`**
+
+逐步移動伺服馬達，避免瞬間跳角造成機構衝擊。一般馬達每步延遲 `DELAY_BIG=15ms`，夾爪馬達每步延遲 `DELAY_GRIP=10ms`，角度範圍用 `constrain()` 限制在 0～180°。
+
+**`pickAndPlace(color)`**
+
+收到 `PICK:COLOR` 後的完整動作序列：
+
+```
+openGripper()
+→ slowMove M2 下降（PICK_DOWN_M2=34）
+→ slowMove M3（PICK_DOWN_M3=90）
+→ closeGripper()
+→ slowMove M3 抬起（PICK_UP_M3=95）
+→ slowMove M2（PICK_UP_M2=85）
+→ slowMove M1 轉到對應顏色放置點
+→ slowMove M2 下降（PLACE_DOWN_M2=36）
+→ slowMove M3（PLACE_DOWN_M3=70）
+→ openGripper()
+→ 抬起 → goHome()
+```
+
+動作執行期間 `isBusy = true`，這段時間收到其他移動指令一律回傳 `BUSY` 並忽略。
+
+---
+
+### 支援的指令列表
+
+| 指令 | 說明 | ACK 回傳 |
+|---|---|---|
+| `DISCOVER_ESP32` | 自動發現廣播 | `ESP32_HERE\|IP=...\|PORT=8888\|RSSI=...` |
+| `PING` | 連線測試 | `PONG\|IP=...\|RSSI=...` |
+| `STATUS` | 查詢目前狀態 | `STATUS\|IP=...\|GW=...\|RSSI=...\|BUSY=0\|M1=90\|...` |
+| `HOME` | 回到 Home 姿態 | `OK\|HOME` |
+| `OPEN` | 夾爪打開 | `OK\|OPEN` |
+| `CLOSE` | 夾爪關閉 | `OK\|CLOSE` |
+| `PICK:RED` | 完整夾取紅色並放置 | `ACK\|PICK_START\|RED` → `DONE\|PICK\|RED` |
+| `PICK:GREEN` | 完整夾取綠色並放置 | `ACK\|PICK_START\|GREEN` → `DONE\|PICK\|GREEN` |
+| `PICK:BLUE` | 完整夾取藍色並放置 | `ACK\|PICK_START\|BLUE` → `DONE\|PICK\|BLUE` |
+| `M1:角度` ~ `M4:角度` | 單顆馬達移動 | `OK\|M1=角度` |
+| `BASE:角度` | 底座（M1）移動（別名） | `OK\|BASE=角度` |
+| `數字` | 直接送數字 → M1 旋轉 | `OK\|BASE=數字` |
+
+---
+
+## 執行前的準備
+
+### 安裝 Python 套件
 
 ```bash
-cd 你的專案資料夾
+pip install opencv-python numpy
 ```
 
-### 步驟 3：執行主程式
+### 燒錄 ESP32
+
+1. 安裝 Arduino IDE，並安裝 `ESP32Servo` 函式庫。
+2. 打開 `sketch_may19a.ino`，修改 `ssid` 和 `password` 為你的熱點名稱與密碼。
+3. 燒錄到 ESP32，打開 Serial Monitor（115200），確認出現 `WiFi Connected!` 與 `IP: ...`。
+
+### 換成手機熱點
+
+只需要改 ESP32 程式裡的 `ssid` 和 `password`，讓 ESP32 連上手機熱點即可。  
+Python 端因為使用 UDP 廣播自動發現，不需要修改任何 IP 設定。  
+手機熱點務必開啟 **2.4GHz 頻段**，ESP32 不支援 5GHz。
+
+---
+
+## 執行方式
 
 ```bash
-python main.py
+python test_version_2-2.py
 ```
 
-### 步驟 4：畫面出現後使用鍵盤控制
-
-- 按 `1`：啟動自動分揀。
-- 按 `2`：停止。
-- 按 `h`：回 Home。
-- 按 `q`：離開程式。
+程式啟動後會自動廣播搜尋 ESP32，找到後 HUD 會顯示 ESP32 IP，即可開始運作。
 
 ---
 
-## 執行後畫面會看到什麼
+## 常見問題
 
-執行後，畫面上通常會看到：
+### ESP32 找不到（NET 顯示 DISCOVER_FAIL）
 
-- ArUco marker 的偵測框。
-- 工作區外框。
-- 原點與座標軸方向。
-- 目標物體的顏色與圈選結果。
-- 世界座標。
-- 當前狀態機狀態。
-- 最後送出的手臂姿態。
+- 確認 ESP32 的 `ssid` / `password` 和熱點一致。
+- 確認 ESP32 Serial Monitor 已出現 `WiFi Connected!`。
+- 電腦和 ESP32 必須在同一個熱點底下，不能一個連電腦熱點、一個連手機熱點。
 
-這些資訊很重要，因為它們可以幫助你判斷系統目前卡在哪一步。
+### 顏色偵測不準
 
----
+- 調整對應顏色的 HSV 範圍（`lower_red1` 等變數）。
+- 現場光線盡量穩定，背景避免與目標顏色相近。
+- `MIN_AREA` 太小會偵測到雜訊，太大會漏掉小物品，可視情況微調。
 
-## 自動流程是怎麼跑的
+### 手臂動作方向不對
 
-當你按下 `1` 後，程式大致上會按照以下順序動作：
+- 調整 `PLACE_RED_M1`、`PLACE_GREEN_M1`、`PLACE_BLUE_M1` 三個角度常數。
+- 調整 `PICK_DOWN_M2`、`PICK_DOWN_M3` 確認下降深度夠。
+- 可用 `r` / `g` / `b` 鍵手動觸發單次夾取測試。
 
-1. `SEARCH`：搜尋物體。
-2. 連續觀測幾幀，確認目標穩定。
-3. `PICK_ABOVE`：移動到物體上方。
-4. `PICK_DOWN`：下降。
-5. `GRAB`：夾住物體。
-6. `LIFT`：抬起。
-7. `PLACE_ABOVE`：移動到對應顏色放置點上方。
-8. `PLACE_DOWN`：下降到放置位置。
-9. `RELEASE`：鬆開夾爪。
-10. `RETURN_HOME`：回到待命位置。
-11. 回到 `SEARCH`，等待下一個物體。
+### 夾完一個後不繼續抓
 
----
-
-## 初學者建議的測試順序
-
-如果你們是第一次整合這套系統，建議不要一次全部上線，而是照下面順序測試。
-
-### 第一關：先確認畫面正常
-
-先執行 `main.py`，確認：
-
-- 有沒有成功打開攝影機。
-- 有沒有看到 ArUco 標記。
-- 有沒有畫出工作區範圍。
-
-### 第二關：確認顏色偵測正常
-
-把紅、綠、藍物品放進工作區，確認：
-
-- 有沒有被圈出來。
-- 顏色名稱對不對。
-- 世界座標有沒有正常顯示。
-
-### 第三關：確認 ESP32 收得到命令
-
-先不要急著讓手臂自動跑完整流程。先確認：
-
-- ESP32 的 IP 對不對。
-- Python 能不能成功送出 `START` / `STOP` / `HOME`。
-- ESP32 序列埠有沒有收到資料。
-
-### 第四關：確認手臂基本姿態正常
-
-先測試：
-
-- Home 姿態有沒有正確。
-- 某一個固定姿態能不能正確移動。
-- 夾爪能不能正常開合。
-
-### 第五關：最後再測完整分揀流程
-
-等前面四關都正常後，再開始測：
-
-- 自動搜尋。
-- 自動抓取。
-- 自動放置到顏色指定點。
-
-這樣比較不會一出問題就完全不知道從哪裡查。
-
----
-
-## 常見問題與排查方式
-
-### 問題 1：看不到 ArUco
-
-請檢查：
-
-- marker 有沒有太小。
-- 光線有沒有太暗。
-- 畫面有沒有反光。
-- 相機角度有沒有太斜。
-- 4 個 marker 的 ID 有沒有貼對位置。
-
-### 問題 2：顏色偵測不穩
-
-請檢查：
-
-- HSV 範圍要不要調整。
-- `min_contour_area` 是否太小。
-- 背景顏色是否太接近目標物。
-- 現場光線是否變化太大。
-
-### 問題 3：手臂動作方向怪怪的
-
-請檢查：
-
-- `place_points` 是否設定正確。
-- 工作區大小設定是否正確。
-- `kinematics.py` 中的座標到角度映射是否需要微調。
-
-### 問題 4：流程一直卡住
-
-請檢查：
-
-- `stable_frames_required` 是否太高。
-- 每個 `dwell_*_sec` 是否太短。
-- 手臂實際移動速度是否比預期慢。
-
-### 問題 5：ESP32 沒反應
-
-請檢查：
-
-- `ESP_IP` 是否正確。
-- 電腦和 ESP32 是否在同一網段。
-- ESP32 韌體是否支援四軸控制。
-- UDP port 是否一致。
-
----
-
-## 建議的組員分工
-
-如果你們是多人專題，可以參考這樣分工：
-
-- 組員 A：負責 `vision.py`，調整顏色偵測與 ArUco 標定。
-- 組員 B：負責 `kinematics.py`，調整手臂姿態和放置點。
-- 組員 C：負責 ESP32 韌體與伺服馬達控制。
-- 組員 D：負責 `planner.py` 和 `main.py`，處理整合與流程測試。
-
----
-
-## 最後提醒
-
-這一版是「可以快速上手、方便展示、好 debug」的 demo 版本。
-
-它的重點是先把整條流程跑通：
-
-- 看見目標。
-- 算出座標。
-- 夾起來。
-- 放到指定顏色位置。
-
-等這一版穩定之後，你們再考慮進一步升級成：
-
-- 更精準的逆運動學。
-- 更穩定的追蹤方法。
-- 更完整的抓取策略。
-
-這樣會比一開始就把所有難題一起塞進去，更符合工程實作的節奏。
+- 確認 `PICK_WAIT_SECONDS`（預設 4.5 秒）比 ESP32 完成整個動作序列的時間長。
+- 若動作很慢，把這個值調大。
