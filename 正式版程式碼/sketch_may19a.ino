@@ -5,8 +5,8 @@
 // =========================================================
 // Wi-Fi 設定
 // =========================================================
-const char* ssid = "Galaxy A54 5G 8A14";
-const char* password = "zft2916eric";
+const char* ssid = "xxxxxxxxxxx";
+const char* password = "xxxxxxxxxx";
 
 // =========================================================
 // UDP 設定
